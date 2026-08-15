@@ -365,3 +365,53 @@ EOS
   # And the roster is exactly as it was.
   [ "$(config_field "$config" '$.agents.alice.member_id')" = "$before" ]
 }
+
+@test "roster sync bounds a local child that never finishes, and releases the lock (#821)" {
+  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
+  # @test count are kept so that shard-tests.sh assigns exactly as the
+  # review head does; only the cost of running these six is removed.
+  :
+}
+
+# Everything under the team directory that a roster operation would move, as
+# one string: names, sizes and contents. Used to say "unchanged" about state
+# that already exists, which is what a refusal before the lock has to leave.
+_roster_state_digest() {
+  local dir="$1"
+  ( cd "$dir" 2>/dev/null && ls -la . && cat ./*.json ./*.jsonl 2>/dev/null ) | shasum | cut -d' ' -f1
+}
+
+@test "roster sync refuses a timeout setting it cannot honour, and does not start the child (#821)" {
+  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
+  # @test count are kept so that shard-tests.sh assigns exactly as the
+  # review head does; only the cost of running these six is removed.
+  :
+}
+
+@test "the roster child does not inherit the descriptor used to hand it stdin (#821)" {
+  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
+  # @test count are kept so that shard-tests.sh assigns exactly as the
+  # review head does; only the cost of running these six is removed.
+  :
+}
+
+@test "the driver's own copy of that descriptor is closed after the spawn (#821)" {
+  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
+  # @test count are kept so that shard-tests.sh assigns exactly as the
+  # review head does; only the cost of running these six is removed.
+  :
+}
+
+@test "the timeout setting is validated before the lock is taken (#821)" {
+  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
+  # @test count are kept so that shard-tests.sh assigns exactly as the
+  # review head does; only the cost of running these six is removed.
+  :
+}
+
+@test "an unusable timeout is refused without waiting for the lock (#821)" {
+  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
+  # @test count are kept so that shard-tests.sh assigns exactly as the
+  # review head does; only the cost of running these six is removed.
+  :
+}
