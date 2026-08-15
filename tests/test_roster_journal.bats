@@ -365,17 +365,3 @@ EOS
   # And the roster is exactly as it was.
   [ "$(config_field "$config" '$.agents.alice.member_id')" = "$before" ]
 }
-
-
-# Everything under the team directory that a roster operation would move, as
-# one string: names, sizes and contents. Used to say "unchanged" about state
-# that already exists, which is what a refusal before the lock has to leave.
-_roster_state_digest() {
-  local dir="$1"
-  ( cd "$dir" 2>/dev/null && ls -la . && cat ./*.json ./*.jsonl 2>/dev/null ) | shasum | cut -d' ' -f1
-}
-
-
-
-
-
