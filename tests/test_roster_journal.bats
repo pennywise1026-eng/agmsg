@@ -367,10 +367,54 @@ EOS
 }
 
 @test "roster sync bounds a local child that never finishes, and releases the lock (#821)" {
-  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
-  # @test count are kept so that shard-tests.sh assigns exactly as the
-  # review head does; only the cost of running these six is removed.
-  :
+  skip_on_windows "POSIX signal delivery is not supported by this test"
+  # A child that neither runs to completion nor lets the shell exit.
+  #
+  # NOT the Windows failure reported on #817: that one is explained by a
+  # holder-metadata write whose failure is swallowed, and by the parent
+  # SIGKILLing this driver after a stdin error — neither of which is this, and
+  # neither of which has been reproduced. What is deterministic here is the
+  # property #821 states, and nothing beyond it.
+  #
+  # Release used to be the
+  # EXIT trap alone, which is sound when this shell reaches its own exit — a
+  # child that fails to launch or exits non-zero still gets there — and not
+  # sound here. The shell waits, the trap never runs, and `.config.lock` is
+  # held by a live process that will never finish. The next start then fails on
+  # `File exists`, and the team is unusable.
+  #
+  # The fake IGNORES TERM, so the grace period and the KILL are exercised too;
+  # a fake that exits on TERM would leave the harder half of the path untested.
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  local config="$team_dir/config.json"
+  local member_id fake status=0
+  member_id="$(config_field "$config" '$.agents.alice.member_id')"
+  source "$SCRIPTS/lib/roster-journal.sh"
+  agmsg_roster_append_left "$team_dir" "$member_id" alice "2026-01-01T00:00:00Z"
+
+  fake="$TEST_SKILL_DIR/fake-node-unkillable"
+  cat > "$fake" <<'EOF'
+#!/usr/bin/env bash
+trap '' TERM
+while :; do sleep 1; done
+EOF
+  chmod +x "$fake"
+
+  run env AGMSG_SYNC_NODE_BIN="$fake" AGMSG_ROSTER_SYNC_TIMEOUT_S=2 \
+    bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+      018f3f7e-0000-7000-8000-000000000001 \
+      018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+
+  # A bounded FAILURE, not a hang and not a success.
+  [ "$status" -ne 0 ]
+  printf '%s' "$output" | grep -q 'did not finish within'
+  # And the lock is gone, which is the whole point: the next start must not
+  # meet `.config.lock: File exists` left by a process that is no longer there.
+  [ ! -d "$team_dir/.config.lock" ]
+  # The child is gone as well — released after the reap, never beside a live
+  # writer.
+  refute pgrep -f "$fake"
 }
 
 # Everything under the team directory that a roster operation would move, as
@@ -382,36 +426,180 @@ _roster_state_digest() {
 }
 
 @test "roster sync refuses a timeout setting it cannot honour, and does not start the child (#821)" {
-  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
-  # @test count are kept so that shard-tests.sh assigns exactly as the
-  # review head does; only the cost of running these six is removed.
-  :
+  # `read -t` rejects a zero, a negative or a non-numeric budget by failing
+  # immediately, and that failure is indistinguishable from "the writer is
+  # gone" — so a mistyped setting used to turn the ceiling off and leave the
+  # wait unbounded. A bound that a typo removes is not a bound.
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo" ran="$TEST_SKILL_DIR/child-ran"
+  local fake="$TEST_SKILL_DIR/fake-node-records"
+  printf '%s\n' '#!/usr/bin/env bash' ': > "$AGMSG_TEST_RAN"' 'exit 0' > "$fake"
+  chmod +x "$fake"
+
+  local before; before="$(_roster_state_digest "$team_dir")"
+  local bad
+  # The last is all digits and still unusable: `[ "$x" -le 0 ]` on it is beyond
+  # the shell's integers and errors, which under `set -e` would end the script
+  # with no sentence at all — a silent refusal, which is the thing being fixed.
+  for bad in 0 -1 abc 1.5 999999999999999999999999999999; do
+    rm -f "$ran"
+    run env AGMSG_TEST_RAN="$ran" AGMSG_SYNC_NODE_BIN="$fake" \
+      AGMSG_ROSTER_SYNC_TIMEOUT_S="$bad" \
+      bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+        018f3f7e-0000-7000-8000-000000000001 \
+        018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+    # Named, not silent, and not a bare non-zero.
+    [ "$status" -ne 0 ]
+    printf '%s' "$output" | grep -q 'AGMSG_ROSTER_SYNC_TIMEOUT_S'
+    # The child is never started: refusing after the work has begun would
+    # leave the state half-written for a setting error.
+    [ ! -e "$ran" ]
+    # And the team's state is UNCHANGED: the refusal happens before the lock
+    # and before `agmsg_roster_ensure`, so a mistyped setting moves nothing.
+    # Compared against what was there, because the journal is created by join
+    # and "it does not exist" would be asserting the wrong thing.
+    [ "$(_roster_state_digest "$team_dir")" = "$before" ]
+    # And the lock does not survive the refusal.
+    [ ! -d "$team_dir/.config.lock" ]
+  done
+
+  # EMPTY IS NOT INVALID — it is unset, and unset takes the default. Asserting
+  # a refusal here would pin the opposite of what `${VAR:-120}` does, and the
+  # first version of this case did exactly that: it read the default path as a
+  # missing guard. Measured, as this test failing against correct code.
+  rm -f "$ran"
+  run env AGMSG_TEST_RAN="$ran" AGMSG_SYNC_NODE_BIN="$fake" \
+    AGMSG_ROSTER_SYNC_TIMEOUT_S="" \
+    bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+      018f3f7e-0000-7000-8000-000000000001 \
+      018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+  [ "$status" -eq 0 ]
+  [ -e "$ran" ]
 }
 
 @test "the roster child does not inherit the descriptor used to hand it stdin (#821)" {
-  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
-  # @test count are kept so that shard-tests.sh assigns exactly as the
-  # review head does; only the cost of running these six is removed.
-  :
+  # `<&9` duplicates the caller's stdin onto the child's fd 0 and leaves fd 9
+  # open beside it unless the redirection closes it. The child then holds the
+  # caller's stream twice — the class that hung a shard twice tonight, arriving
+  # through the descriptor added to fix it.
+  #
+  # Asserted from INSIDE the child, because that is the only place the answer
+  # exists: a reader of the source can be told `9<&-` is there, and reading is
+  # what let this back in.
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo"
+  local seen="$TEST_SKILL_DIR/child-fd9" fake="$TEST_SKILL_DIR/fake-node-fd"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'if : <&9 2>/dev/null; then printf open > "$AGMSG_TEST_FD_SEEN"'
+    printf '%s\n' 'else printf closed > "$AGMSG_TEST_FD_SEEN"; fi'
+    # THE PARENT'S COPY, asked of the parent. With the FIFO design this child is
+    # spawned by the driver shell itself, so $PPID is the driver and its
+    # descriptor table answers directly where one is readable. Where it is not
+    # -- macOS has no /proc -- this records that it could not look, rather than
+    # reporting "closed" from an instrument that cannot see.
+    printf '%s\n' 'if [ -d "/proc/$PPID/fd" ]; then'
+    printf '%s\n' '  if [ -e "/proc/$PPID/fd/9" ]; then printf parent-open > "$AGMSG_TEST_FD_PARENT"'
+    printf '%s\n' '  else printf parent-closed > "$AGMSG_TEST_FD_PARENT"; fi'
+    printf '%s\n' 'else printf parent-unreadable > "$AGMSG_TEST_FD_PARENT"; fi'
+    printf '%s\n' 'exit 0'
+  } > "$fake"
+  chmod +x "$fake"
+
+  local parent_seen="$TEST_SKILL_DIR/parent-fd9"
+  run env AGMSG_TEST_FD_SEEN="$seen" AGMSG_TEST_FD_PARENT="$parent_seen" \
+    AGMSG_SYNC_NODE_BIN="$fake" \
+    bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+      018f3f7e-0000-7000-8000-000000000001 \
+      018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+  [ "$status" -eq 0 ]
+  # The child ran at all — without this the assertions below pass on files
+  # that were never written.
+  [ -e "$seen" ]
+  [ -e "$parent_seen" ]
+  [ "$(cat "$seen")" = "closed" ]
+  # Where the descriptor table is readable, the parent's copy is gone too.
+  # Where it is not, the case says so instead of asserting an answer it did
+  # not get: an instrument that cannot look must not report "closed".
+  case "$(cat "$parent_seen")" in
+    parent-unreadable) : ;;
+    *) [ "$(cat "$parent_seen")" = "parent-closed" ] ;;
+  esac
+  [ ! -d "$team_dir/.config.lock" ]
 }
 
 @test "the driver's own copy of that descriptor is closed after the spawn (#821)" {
-  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
-  # @test count are kept so that shard-tests.sh assigns exactly as the
-  # review head does; only the cost of running these six is removed.
-  :
+  # A STRUCTURAL CHECK, and it is here because the behavioural one above cannot
+  # run everywhere: reading another live process's descriptors needs /proc, and
+  # macOS has none. Reverting the parent's close would then be green on half
+  # the matrix — which is how a leak survives.
+  #
+  # So the order is asserted where it lives: the spawn, then `exec 9<&-`, with
+  # both anchors required to exist so this cannot pass by finding nothing.
+  local sh="$SCRIPTS/internal/roster-sync-driver.sh" spawn_at close_at
+  spawn_at="$(grep -n '<&9 9<&- 3>&- 4>&- 8> "\$_roster_fifo" &' "$sh" | head -1 | cut -d: -f1)"
+  close_at="$(grep -n '^  exec 9<&-$' "$sh" | head -1 | cut -d: -f1)"
+  [ -n "$spawn_at" ]
+  [ -n "$close_at" ]
+  [ "$close_at" -gt "$spawn_at" ]
 }
 
 @test "the timeout setting is validated before the lock is taken (#821)" {
-  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
-  # @test count are kept so that shard-tests.sh assigns exactly as the
-  # review head does; only the cost of running these six is removed.
-  :
+  # WHY THIS IS STRUCTURAL, having tried the other way: moving the validation
+  # back after `agmsg_lock_acquire` and `agmsg_roster_ensure` leaves every
+  # behavioural assertion green. The refusal still releases the lock, and
+  # `agmsg_roster_ensure` is idempotent, so "the team's state is unchanged"
+  # cannot tell the two orders apart. Measured — that mutation was run and
+  # stayed green.
+  #
+  # What the order buys is that a setting error never takes the critical
+  # section at all, which matters on a machine where taking it is the risky
+  # part. So the order is asserted where it lives, with both anchors required
+  # to exist so this cannot pass by finding nothing.
+  local sh="$SCRIPTS/internal/roster-sync-driver.sh" check_at lock_at
+  check_at="$(grep -n 'AGMSG_ROSTER_SYNC_TIMEOUT_S must be a positive' "$sh" | head -1 | cut -d: -f1)"
+  lock_at="$(grep -n '^agmsg_lock_acquire "\$team_dir"$' "$sh" | head -1 | cut -d: -f1)"
+  [ -n "$check_at" ]
+  [ -n "$lock_at" ]
+  [ "$check_at" -lt "$lock_at" ]
 }
 
 @test "an unusable timeout is refused without waiting for the lock (#821)" {
-  # BODY REPLACED FOR A PROBE — not to be landed. The case name and the
-  # @test count are kept so that shard-tests.sh assigns exactly as the
-  # review head does; only the cost of running these six is removed.
-  :
+  # THE ORDER, MEASURED — not read.
+  #
+  # A held lock is what makes the two orders observably different: validating
+  # first refuses at once, validating after `agmsg_lock_acquire` spends the
+  # whole lock budget and then reports a lock timeout instead. Without a holder
+  # both orders look identical from outside, which is why the first attempt at
+  # this control could not discriminate and the property was asserted
+  # structurally.
+  bash "$SCRIPTS/join.sh" demo alice claude-code /tmp/a
+  local team_dir="$TEST_SKILL_DIR/teams/demo" ran="$TEST_SKILL_DIR/child-ran2"
+  local fake="$TEST_SKILL_DIR/fake-node-records2"
+  printf '%s\n' '#!/usr/bin/env bash' ': > "$AGMSG_TEST_RAN"' 'exit 0' > "$fake"
+  chmod +x "$fake"
+
+  # Somebody else holds it. Made by hand rather than by another driver: what
+  # matters is that the directory is there, which is exactly what the lock is.
+  mkdir -p "$team_dir/.config.lock"
+
+  local began=$SECONDS
+  run env AGMSG_TEST_RAN="$ran" AGMSG_SYNC_NODE_BIN="$fake" \
+    AGMSG_LOCK_SECONDS=10 AGMSG_ROSTER_SYNC_TIMEOUT_S=0 \
+    bash "$SCRIPTS/internal/roster-sync-driver.sh" reconcile demo \
+      018f3f7e-0000-7000-8000-000000000001 \
+      018f3f7e-0000-7000-8000-000000000002 1 </dev/null
+  local took=$((SECONDS - began))
+
+  [ "$status" -ne 0 ]
+  # The SETTING is what it complains about, not the lock: reaching the lock at
+  # all means the check ran too late.
+  printf '%s' "$output" | grep -q 'AGMSG_ROSTER_SYNC_TIMEOUT_S'
+  refute grep -q 'timed out acquiring registry lock' <<<"$output"
+  # And it did not spend the lock budget getting there.
+  [ "$took" -lt 5 ]
+  [ ! -e "$ran" ]
+  # Someone else's lock is still theirs.
+  [ -d "$team_dir/.config.lock" ]
+  rmdir "$team_dir/.config.lock"
 }
